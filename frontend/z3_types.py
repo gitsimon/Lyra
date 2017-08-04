@@ -6,10 +6,10 @@ Limitations:
 """
 from collections import OrderedDict
 from frontend.annotation_resolver import AnnotationResolver
+from frontend.class_node import ClassNode
 from frontend.pre_analysis import PreAnalyzer
 from frontend.stubs.stubs_handler import StubsHandler
 from z3 import *
-
 
 set_param("auto-config", False)
 set_param("smt.mbqi", False)
@@ -39,13 +39,13 @@ class TypesSolver(Solver):
         self.element_id = 0     # unique id given to newly created Z3 consts
         self.assertions_vars = []
         self.assertions_errors = {}
-        analyzer = PreAnalyzer(tree, "tests/inference")     # TODO: avoid hard-coding
-        self.stubs_handler = StubsHandler(analyzer)
+        self.stubs_handler = StubsHandler()
+        analyzer = PreAnalyzer(tree, "tests/inference", self.stubs_handler)     # TODO: avoid hard-coding
         self.config = analyzer.get_all_configurations()
-        self.z3_types = Z3Types(self.config)
+        self.z3_types = Z3Types(self.config, self)
         self.annotation_resolver = AnnotationResolver(self.z3_types)
         self.optimize = Optimize(ctx)
-        self.optimize.set("timeout", 30000)
+        # self.optimize.set("timeout", 30000)
         self.init_axioms()
 
     def add(self, *args, fail_message):
@@ -56,7 +56,9 @@ class TypesSolver(Solver):
         super().add(Implies(assertion, And(*args)))
 
     def init_axioms(self):
-        self.add(self.z3_types.inheritance + self.z3_types.subtyping, fail_message="Subtyping error")
+        for st in self.z3_types.subtyping:
+            self.add(st, fail_message="Subtyping error")
+        self.add(self.z3_types.subst_axioms, fail_message="Subst definition")
 
     def infer_stubs(self, context, infer_func):
         self.stubs_handler.infer_all_files(context, self, self.config.used_names, infer_func)
@@ -76,11 +78,14 @@ class TypesSolver(Solver):
 
 
 class Z3Types:
-    def __init__(self, config):
+    def __init__(self, config, solver):
         self.config = config
         self.all_types = OrderedDict()
         self.instance_attributes = OrderedDict()
         self.class_attributes = OrderedDict()
+        self.class_to_init_count = config.class_to_init_count
+
+        self.new_z3_const = solver.new_z3_const
 
         max_tuple_length = config.max_tuple_length
         max_function_args = config.max_function_args
@@ -88,7 +93,7 @@ class Z3Types:
         classes_to_class_attrs = config.classes_to_class_attrs
         class_to_base = config.class_to_base
 
-        type_sort = declare_type_sort(max_tuple_length, max_function_args, classes_to_instance_attrs)
+        type_sort = declare_type_sort(max_tuple_length, max_function_args, classes_to_instance_attrs, config.type_params)
         self.type_sort = type_sort
 
         # type constructors and accessors
@@ -129,154 +134,175 @@ class Z3Types:
         create_classes_attributes(type_sort, classes_to_instance_attrs, self.instance_attributes)
         create_classes_attributes(type_sort, classes_to_class_attrs, self.class_attributes)
 
-        # constants to be used in quantifiers
-        x = Const("x", type_sort)
-        y = Const("y", type_sort)
-        z = Const("z", type_sort)
+        method_sort = Datatype("Method")
+        method_sort.declare('m__none')
 
-        # function representing inheritance between types: extends(x, y) if and only if x inherits from y
-        self.extends = Function("extends", type_sort, type_sort, BoolSort())
+        self.tvs = []
+        self.method_ids = {}
+        self.tv_to_method = {}
+        for m, vrs in config.type_params.items():
+            method_sort.declare('m__' + m)
+            for v in vrs:
+                tv = getattr(type_sort, 'tv' + str(v))
+                self.tvs.append(tv)
+                setattr(self, 'tv' + str(v), tv)
+
+        method_sort = method_sort.create()
+        self.method_sort = method_sort
+        for m, vrs in config.type_params.items():
+            method_id = getattr(method_sort, 'm__' + m)
+            self.method_ids[m] = method_id
+            for v in vrs:
+                tv = getattr(type_sort, 'tv' + str(v))
+                self.tv_to_method[tv] = method_id
+
+
+        self.generics = [type_sort.generic1, type_sort.generic2, type_sort.generic3]
+        self.generic1_tv1 = type_sort.generic1_tv1
+        self.generic1_func = type_sort.generic1_func
+        self.generic2_tv1 = type_sort.generic2_tv1
+        self.generic2_tv2 = type_sort.generic2_tv2
+        self.generic2_func = type_sort.generic2_func
+        self.generic3_tv1 = type_sort.generic3_tv1
+        self.generic3_tv2 = type_sort.generic3_tv2
+        self.generic3_tv3 = type_sort.generic3_tv3
+        self.generic3_func = type_sort.generic3_func
+        self.subst = Function('subst', type_sort, type_sort, type_sort, type_sort)
+        self.upper = Function('upper', type_sort, type_sort)
+
         # function representing subtyping between types: subtype(x, y) if and only if x is a subtype of y
-        self.subtype = Function("subtype", type_sort, type_sort, BoolSort())
-        # function representing absence of subtyping between types
-        self.not_subtype = Function("not subtype", type_sort, type_sort, BoolSort())
+        self._subtype = Function("subtype", method_sort, type_sort, type_sort, BoolSort())
+        self.current_method = method_sort.m__none
+        tree = self.create_class_tree(config.all_classes, type_sort)
+        self.subtyping = self.create_subtype_axioms(tree)
+        self.subst_axioms = self.create_subst_axioms(tree)
 
-        self.inheritance = [
-            # types
-            ForAll([x], self.extends(self.type(x), self.object), patterns=[self.type(x)], qid="type is obj"),
-            # none
-            self.extends(self.none, self.object),
-            # numbers
-            self.extends(self.num, self.object),
-            self.extends(self.complex, self.num),
-            self.extends(self.float, self.complex),
-            self.extends(self.int, self.float),
-            self.extends(self.bool, self.int),
-            # sequences
-            self.extends(self.seq, self.object),
-            self.extends(self.string, self.seq),
-            self.extends(self.bytes, self.seq),
-            self.extends(self.tuple, self.seq),
-            ForAll([x], self.extends(self.list(x), self.seq), patterns=[self.list(x)], qid="list is seq"),
-            # sets
-            ForAll([x], self.extends(self.set(x), self.object), patterns=[self.set(x)], qid="set is obj"),
-            # dictionaries
-            ForAll([x, y], self.extends(self.dict(x, y), self.object), patterns=[self.dict(x, y)], qid="dict is obj"),
-        ]
+    def subtype(self, t0, t1):
+        res = self._subtype(self.current_method, t0, t1)
+        return res
 
-        self.subtyping = [
-            # reflexivity
-            ForAll(x, self.subtype(x, x), patterns=[self.subtype(x, x)], qid="reflex"),
-            # antisymmetry
-            ForAll([x, y], Implies(And(self.subtype(x, y), self.subtype(y, x)), x == y),
-                   patterns=[MultiPattern(self.subtype(x, y), self.subtype(y, x))], qid="antisym"),
-            # transitivity
-            ForAll([x, y, z], Implies(And(self.subtype(x, y), self.subtype(y, z)), self.subtype(x, z)),
-                   patterns=[MultiPattern(self.subtype(x, y), self.subtype(y, z))], qid="trans"),
+    def create_class_tree(self, all_classes, type_sort):
+        """
+        Creates a tree consisting of ClassNodes which contains all classes in all_classes,
+        where child nodes are subclasses. The root will be object.
+        """
+        tree = ClassNode('object', None, type_sort)
+        to_cover = list(all_classes.keys())
+        covered = {'object'}
+        i = 0
+        while i < len(to_cover):
+            current = to_cover[i]
+            i += 1
+            base = all_classes[current]
+            if base not in covered:
+                to_cover.append(current)
+                continue
+            base_node = tree.find(base)
+            current_node = ClassNode(current, base_node, type_sort)
+            base_node.children.append(current_node)
+            covered.add(current)
+        return tree
 
-            # inheritance implies subtyping: if x inherits from y, then x is a subtype of y
-            #       y
-            #     /
-            #   x
-            ForAll([x, y], Implies(self.extends(x, y), self.subtype(x, y)),
-                   patterns=[self.extends(x, y)], qid="extends"),
-            # if different types x and y inherit from the same type z, then they cannot be subtypes of each other
-            #       z
-            #     /   \
-            #   x       y
-            ForAll([x, y, z], Implies(And(x != y, self.extends(x, z), self.extends(y, z)),
-                                      And(self.not_subtype(x, y), self.not_subtype(y, x))),
-                   patterns=[MultiPattern(self.extends(x, z), self.extends(y, z))], qid="not_subtype"),
-            # if x is a subtype of y and y is not a subtype of z, then x cannot be a subtype of z
-            #       o
-            #     /   \
-            #   z       y
-            #             \
-            #               x
-            ForAll([x, y, z], Implies(And(self.subtype(x, y), self.not_subtype(y, z)),
-                                      Not(self.subtype(x, z))),
-                   patterns=[MultiPattern(self.subtype(x, y), self.not_subtype(y, z))], qid="not subtype"),
-
-            # a generic type is invariant
-            ForAll([x, y], Implies(self.subtype(x, self.type(y)), x == self.type(y)),
-                   patterns=[self.subtype(x, self.type(y))], qid="generic type"),
-            # a generic list type is invariant
-            ForAll([x, y], Implies(self.subtype(x, self.list(y)), x == self.list(y)),
-                   patterns=[self.subtype(x, self.list(y))], qid="generic list"),
-            # a generic set type is invariant
-            ForAll([x, y], Implies(self.subtype(x, self.set(y)), x == self.set(y)),
-                   patterns=[self.subtype(x, self.set(y))], qid="generic set"),
-            # a generic dictionary type is invariant
-            ForAll([x, y, z], Implies(self.subtype(x, self.dict(y, z)), x == self.dict(y, z)),
-                   patterns=[self.subtype(x, self.dict(y, z))], qid="generic dict")
-        ] + self.tuples_axioms() + self.functions_axioms() + self.classes_axioms(class_to_base)
-
-    def tuples_axioms(self):
-        """Axioms for tuple subtyping."""
-        type_sort = self.type_sort
-        tuples = self.tuples
-
-        # constants to be used in quantifiers
-        x = Const("x", type_sort)
-        # each tuple needs a number of constants equal to its length
-        # for n tuples, from zero-length to (n - 1)-length, we need at most n - 1 constants
-        consts = [Const("tuples_q_{}".format(x), type_sort) for x in range(len(tuples) - 1)]
-#
-        axioms = list()
-        # zero-length tuple
-        axioms.append(self.extends(tuples[0], type_sort.tuple))
-        # a generic zero-length tuple type is invariant
-        axioms.append(ForAll(x, Implies(self.subtype(x, tuples[0]), x == tuples[0]),
-                             patterns=[self.subtype(x, tuples[0])]))
-        # i-length tuples
-        for i in range(1, len(tuples)):
-            quantified = consts[:i]         # tuples[i] uses i constants
-            inst = tuples[i](quantified)    # type of tuples[i]
-            # tuples[i] inherits from sequence
-            axioms.append(ForAll(quantified, self.extends(inst, type_sort.tuple), patterns=[inst]))
-            # a generic tuple type is invariant
-            axioms.append(ForAll([x] + quantified, Implies(self.subtype(x, inst), x == inst),
-                          patterns=[self.subtype(x, inst)]))
-        return axioms
-
-    def functions_axioms(self):
-        """Axioms for function subtyping."""
-        type_sort = self.type_sort
-        funcs = self.funcs
-
-        # constants to be used in quantifiers
-        x = Const("x", type_sort)
-        defaults = Const("defaults", IntSort())
-        # each function needs a number of constants equal to the number of its arguments plus one (for the return type)
-        # for n functions, with zero to (n - 1) arguments, we need at most n constants
-        consts = [Const("funcs_q_{}".format(x), type_sort) for x in range(len(funcs))]
-
-        axioms = list()
-        for i in range(len(funcs)):
-            quantified = [defaults] + consts[:i + 1]    # funcs[i] uses i+1 constants
-            inst = funcs[i](quantified)                 # type of funcs[i]
-            # funcs[i] inherits from object
-            axioms.append(ForAll(quantified, self.extends(inst, type_sort.object), patterns=[inst]))
-            # a generic function type is invariant
-            axioms.append(ForAll([x] + quantified, Implies(self.subtype(x, inst), x == inst),
-                                 patterns=[self.subtype(x, inst)]))
-        return axioms
-
-    def classes_axioms(self, sub_to_base):
-        """Axioms for class subtyping."""
-        classes = self.classes
-        type_sort = self.type_sort
+    def create_subst_axioms(self, tree):
         axioms = []
-        for cls in classes:
-            base_name = sub_to_base[cls]
-            if base_name == "object":   # if the base class is object...
-                axioms.append(self.extends(classes[cls], type_sort.object))     # cls inherits from object
-            else:
-                axioms.append(self.extends(classes[cls], classes[base_name]))   # cls inherits from its base class
+        what = self.new_z3_const('what', self.type_sort)
+        by = self.new_z3_const('by', self.type_sort)
+        for c in tree.all_children():
+            literal = c.get_literal()
+            subst_literal = c.get_literal(lambda x: self.subst(x, what, by))
+            axiom = ForAll([what, by] + c.quantified(), self.subst(literal, what, by) == If(literal == what, by, subst_literal),
+                           patterns=[self.subst(literal, what, by)])
+            axioms.append(axiom)
+        for i in range(3):
+            args = []
+            for j in range(i + 1):
+                args.append(self.new_z3_const('v' + str(j + 1), self.type_sort))
+            func = self.generics[i]
+            normal_func = self.new_z3_const('normal_func', self.type_sort)
+            literal = func(*args, normal_func)
+            axiom = ForAll([what, by, normal_func] + args,
+                           self.subst(literal, what, by) == literal,
+                           patterns=[self.subst(literal, what, by)])
+            axioms.append(axiom)
+
+        for tv in self.tvs:
+            axiom = ForAll([what, by], self.subst(tv, what, by) == If(what == tv, by, tv),
+                           patterns=[self.subst(tv, what, by)])
+            axioms.append(axiom)
+
+        return axioms
+
+    def create_subtype_axioms(self, tree):
+        """
+        Creates axioms defining subtype relations for all possible classes.
+        """
+        axioms = []
+        x = self.new_z3_const("x", self.type_sort)
+        m = self.new_z3_const('m', self.method_sort)
+        # For each class C in the program, create two axioms:
+        for c in tree.all_children():
+            c_literal = c.get_literal()
+
+            # One which is triggered by subtype(C, X)
+            options = []
+            for sub in c.all_super():
+                options.append(x == sub.get_literal())
+
+            subtype_expr = self._subtype(m, c_literal, x)
+            axiom = ForAll([x, m] + c.quantified(), subtype_expr == Or(*options),
+                           patterns=[subtype_expr])
+            axioms.append(axiom)
+
+            # And one which is triggered by subtype(X, C)
+            options = []
+            for super in c.all_children():
+                if super is c:
+                    options.append(x == c_literal)
+                else:
+                    options.append(x == super.get_literal_with_args(x))
+
+            for tv in self.tvs:
+                option = And(m == self.tv_to_method[tv], x == tv, self._subtype(m, self.upper(tv), c_literal))
+                options.append(option)
+
+            subtype_expr = self._subtype(m, x, c_literal)
+            axiom = ForAll([x, m] + c.quantified(), subtype_expr == Or(*options),
+                           patterns=[subtype_expr])
+            axioms.append(axiom)
+        for tv in self.tvs:
+            options = [x == tv]
+            for tvp in self.tvs:
+                if tvp is tv:
+                    continue
+                if self.tv_to_method[tv] is not self.tv_to_method[tvp]:
+                    continue
+                options.append(And(m == self.tv_to_method[tv], x == tvp, self.upper(tvp) == tv))
+            axiom = ForAll([x, m], self._subtype(m, x, tv) == Or(*options),
+                           patterns=[self._subtype(m, x, tv)])
+            axioms.append(axiom)
+            axiom = ForAll([x, m], self._subtype(m, tv, x) == Or(x == tv, And(m == self.tv_to_method[tv], self._subtype(m, self.upper(tv), x))),
+                           patterns=[self._subtype(m, tv, x)])
+            axioms.append(axiom)
+
+        for i in range(3):
+            args = []
+            for j in range(i + 1):
+                args.append(self.new_z3_const('v' + str(j + 1), self.type_sort))
+            func = self.generics[i]
+            normal_func = self.new_z3_const('normal_func', self.type_sort)
+            literal = func(*args, normal_func)
+            axiom = ForAll([x, m] + args + [normal_func],
+                           self._subtype(m, literal, x) == (x == literal),
+                           patterns=[self._subtype(m, literal, x)])
+            axioms.append(axiom)
+            axiom = ForAll([x, m] + args + [normal_func],
+                           self._subtype(m, x, literal) == (x == literal),
+                           patterns=[self._subtype(m, x, literal)])
+            axioms.append(axiom)
         return axioms
 
 
-def declare_type_sort(max_tuple_length, max_function_args, classes_to_instance_attrs):
+def declare_type_sort(max_tuple_length, max_function_args, classes_to_instance_attrs, type_params):
     """Declare the type data type and all its constructors and accessors."""
     type_sort = Datatype("Type")
 
@@ -290,6 +316,15 @@ def declare_type_sort(max_tuple_length, max_function_args, classes_to_instance_a
     type_sort.declare("float")
     type_sort.declare("int")
     type_sort.declare("bool")
+
+    for cls, vrs in type_params.items():
+        for v in vrs:
+            type_sort.declare('tv' + str(v))
+
+    type_sort.declare('generic1', ('generic1_tv1', type_sort), ('generic1_func', type_sort))
+    type_sort.declare('generic2', ('generic2_tv1', type_sort), ('generic2_tv2', type_sort), ('generic2_func', type_sort))
+    type_sort.declare('generic3', ('generic3_tv1', type_sort), ('generic3_tv2', type_sort), ('generic3_tv3', type_sort), ('generic3_func', type_sort))
+
     # sequences
     type_sort.declare("sequence")
     type_sort.declare("str")

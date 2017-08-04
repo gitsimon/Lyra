@@ -400,6 +400,9 @@ def has_type_var(node, solver):
 
 def _infer_func_def(node, context, solver):
     """Infer the type for a function definition"""
+    if context.type_params.get(node.name):
+        old_method = solver.z3_types.current_method
+        solver.z3_types.current_method = solver.z3_types.method_ids[node.name]
     if is_stub(node) or has_type_var(node, solver):
         return_annotation = node.returns
         args_annotations = []
@@ -418,6 +421,7 @@ def _infer_func_def(node, context, solver):
 
     func_context, args_types = _init_func_context(node.args.args, context, solver)
     result_type = solver.new_z3_const("func")
+    result_type.args_count = len(node.args.args)
     context.set_type(node.name, result_type)
 
     if hasattr(node.args, "defaults"):
@@ -439,8 +443,19 @@ def _infer_func_def(node, context, solver):
         body_type = _infer_body(node.body, func_context, node.lineno, solver)
 
     func_type = solver.z3_types.funcs[len(args_types)]((defaults_len,) + args_types + (body_type,))
-    solver.add(result_type == func_type,
-               fail_message="Function definition in line {}".format(node.lineno))
+
+    if context.type_params.get(node.name):
+        args = context.type_params.get(node.name)
+        func = solver.z3_types.generics[len(args) - 1]
+        args = [getattr(solver.z3_types, 'tv' + str(a)) for a in args]
+        solver.add(
+            result_type == func(*args, func_type),
+            fail_message="Generic function definition in line {}".format(node.lineno))
+    else:
+        solver.add(result_type == func_type,
+                   fail_message="Function definition in line {}".format(node.lineno))
+    if context.type_params.get(node.name):
+        solver.z3_types.current_method = old_method
 
 
 def _infer_class_def(node, context, solver):
@@ -457,8 +472,18 @@ def _infer_class_def(node, context, solver):
     for attr in class_context.types_map:
         solver.add(class_attrs[attr] == class_context.types_map[attr],
                    fail_message="Class attribute in {}".format(node.lineno))
+
+    # Set the type of the first arg in the class methods to be instance of this class
+    # TODO check staticmethod decorator
+    for func_name, args_count in solver.config.class_to_funcs[node.name]:
+        func_type = class_context.get_type(func_name)
+        arg_accessor = getattr(solver.z3_types.type_sort, "func_{}_arg_1".format(args_count))
+        solver.add(arg_accessor(func_type) == instance_type,
+                   fail_message="First arg in class methods has class instance type")
+
     class_type = solver.z3_types.type(instance_type)
     solver.add(result_type == class_type, fail_message="Class definition in line {}".format(node.lineno))
+    result_type.is_class = True
     context.set_type(node.name, result_type)
 
 

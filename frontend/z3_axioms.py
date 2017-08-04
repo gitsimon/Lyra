@@ -1,4 +1,4 @@
-from frontend.z3_types import And, Or, Implies, Not
+from frontend.z3_types import And, Or, Implies, Not, Exists, Const
 
 
 def add(left, right, result, types):
@@ -20,6 +20,8 @@ def add(left, right, result, types):
             And(types.subtype(left, types.seq), left == right, left == result),
             And(types.subtype(left, types.num), types.subtype(right, left), result == left),
             And(types.subtype(right, types.num), types.subtype(left, right), result == right),
+            And(types.subtype(right, types.num), types.subtype(left, types.num),
+                result == types.num),
 
             # result from list addition is a list with a supertype of operands' types
             And(left == types.list(types.list_type(left)),
@@ -197,7 +199,8 @@ def index(indexed, ind, result, types):
             [indexed == types.dict(ind, result),
              And(types.subtype(ind, types.int), indexed == types.list(result)),
              And(types.subtype(ind, types.int), indexed == types.string, result == types.string),
-             And(types.subtype(ind, types.int), indexed == types.bytes, result == types.bytes)]
+             And(types.subtype(ind, types.int), indexed == types.bytes, result == types.bytes),
+             ]
             + t
         )
     ]
@@ -249,45 +252,6 @@ def assignment(target, value, types):
     return [
         types.subtype(value, target)
     ]
-
-
-def multiple_assignment(target, value, position, types):
-    """Constraints for multiple assignments
-    
-    :param target: The type of the assignment target (LHS)
-    :param value: The type of the assignment value (RHS)
-    :param position: The position of the target/value in the multiple assignment
-    :param types: The types object containing z3 types
-    
-    Cases:
-        - List: a, b = [1, 2]
-        - types.set: a, b = 1, "string"
-        
-    Ex:
-        - a, b = [1, 2]
-        
-        The above example calls this function twice:
-            * first time: target := type(a), value := type(1), position := 0
-            * second time: target := type(b), value := type(2), position := 1
-    """
-
-    # List multiple assignment
-    lst = [value == types.list(target)]
-
-    # tuple multiple assignment:
-    # Assert with tuples of different lengths, maintaining the correct position of the target in the tuple.
-    t = []
-    for cur_len in range(position + 1, len(types.tuples)):
-        before_target = [getattr(types.type_sort, "tuple_{}_arg_{}".format(cur_len, i + 1))(value)
-                         for i in range(position)]  # The tuple elements before the target
-        after_target = [getattr(types.type_sort, "tuple_{}_arg_{}".format(cur_len, i + 1))(value)
-                        for i in range(position + 1, cur_len)]  # The tuple elements after the target
-
-        params = before_target + [target] + after_target  # The parameters to instantiate the tuple
-
-        t.append(value == types.tuples[cur_len](*params))
-
-    return [Or(lst + t)]
 
 
 def subscript_assignment(target, types):
@@ -364,6 +328,44 @@ def try_except(then, orelse, final, result, types):
     ]
 
 
+def one_type_instantiation(class_name, args, result, types):
+    """Constraints for class instantiation, if the class name is known
+    
+    :param class_name: The class to be instantiated
+    :param args: the types of the arguments passed to the class instantiation
+    :param result: The resulting instance from instantiation
+    :param types: Z3Types object for this inference program
+    """
+    init_args_count = types.class_to_init_count[class_name]
+
+    # Get the instance accessor from the type_sort data type.
+    instance = getattr(types.type_sort, "instance")(types.all_types[class_name])
+
+    # Get the __init__ function of the this class
+    init_func = types.instance_attributes[class_name]["__init__"]
+
+    # Assert that it's a call to this __init__ function
+
+    # Get the default args count
+    defaults_accessor = getattr(types.type_sort, "func_{}_defaults_args".format(init_args_count))
+    default_count = defaults_accessor(init_func)
+
+    rem_args_count = init_args_count - len(args) - 1
+    rem_args = []
+    for i in range(rem_args_count):
+        arg_idx = len(args) + i + 2
+        # Get the default arg type
+        arg_accessor = getattr(types.type_sort, "func_{}_arg_{}".format(init_args_count, arg_idx))
+        rem_args.append(arg_accessor(init_func))
+
+    all_args = (instance,) + args + tuple(rem_args) + (types.none,)  # The return type of __init__ is None
+    z3_func_args = (default_count,) + all_args
+    # Assert that it's a call to this __init__ function
+    return And(
+        result == instance,
+        init_func == types.funcs[len(args) + len(rem_args) + 1](z3_func_args), default_count >= rem_args_count)
+
+
 def instance_axioms(called, args, result, types):
     """Constraints for class instantiation
     
@@ -380,28 +382,8 @@ def instance_axioms(called, args, result, types):
     # Assert with __init__ function of all classes in the program
     axioms = []
     for t in types.all_types:
-        # Get the instance accessor from the type_sort data type.
-        instance = getattr(types.type_sort, "instance")(types.all_types[t])
-
-        # Get the __init__ function of the current class
-        init_func = types.instance_attributes[t]["__init__"]
-
-        # Assert that it's a call to this __init__ function
-
-        # Get the default args count
-        defaults_accessor = getattr(types.type_sort, "func_{}_defaults_args".format(len(args) + 1))
-        default_count = defaults_accessor(init_func)
-
-        all_args = (instance,) + tuple(args) + (types.none,)  # The return type of __init__ is None
-        z3_func_args = (default_count,) + all_args
-
-        # TODO default args in __init__ function
-        axioms.append(
-            And(called == types.all_types[t],
-                result == instance,
-                init_func == types.funcs[len(args) + 1](z3_func_args),
-                ))
-
+        axioms.append(And(one_type_instantiation(t, args, result, types),
+                          called == types.all_types[t]))
     return axioms
 
 
@@ -427,13 +409,60 @@ def function_call_axioms(called, args, result, types):
         defaults_count = defaults_accessor(called)
         # Add the axioms for function call, default args count, and arguments subtyping.
         axioms.append(And(called == types.funcs[i]((defaults_accessor(called),) + tuple(args) + rem_args_types + (result,)),
+
                           defaults_count >= rem_args,
                           defaults_count <= types.config.max_default_args))
-
     return axioms
 
 
-def call(called, args, result, types):
+def generic_call_axioms(called, args, result, types, tvs):
+    axioms = []
+    for i in range(3):
+        generic_constr = types.generics[i]
+        cargs = []
+        for j in range(i + 1):
+            cargs.append(getattr(types, 'generic{}_tv{}'.format(i + 1, j + 1))(called))
+        is_generic = called == generic_constr(*cargs, getattr(types, 'generic{}_func'.format(i + 1))(called))
+
+        under_upper = []
+        for k, ta in enumerate(tvs):
+            if not k <= i:
+                break
+            current_tv = getattr(types, 'generic{}_tv{}'.format(i + 1, k + 1))(called)
+            def mysubst(a):
+                res = a
+                for l in range(k):
+                    res = types.subst(res, cargs[l], tvs[l])
+                return res
+            under_upper.append(types.subtype(ta, mysubst(types.upper(current_tv))))
+
+        def mysubst(a):
+            res = a
+            for arg, tv in zip(cargs, tvs):
+                res = types.subst(res, arg, tv)
+            return res
+
+        called_func = getattr(types, 'generic{}_func'.format(i + 1))(called)
+
+        if len(args) == 0:
+            axioms.append(mysubst(called_func) == types.funcs[0](0, result))
+        else:
+            subtype_axioms = []
+            z3_args = []
+            for i in range(len(args)):
+                z3_arg = mysubst(getattr(types.type_sort, "func_{}_arg_{}".format(len(args), i + 1))(called_func))
+                z3_args.append(z3_arg)
+                arg = args[i]
+                subtype_axioms.append(types.subtype(arg, z3_arg))
+
+            func_type = types.funcs[len(args)]
+            z3_args.append(result)
+            res = And(subtype_axioms + [mysubst(called_func) == func_type(0, *z3_args)])
+            axioms.append(And(is_generic, *under_upper, res))
+    return axioms
+
+
+def call(called, args, result, types, tvs):
     """Constraints for calls
     
     Cases:
@@ -442,7 +471,9 @@ def call(called, args, result, types):
     """
     return [
         Or(
-           function_call_axioms(called, args, result, types) + instance_axioms(called, args, result, types)
+            function_call_axioms(called, args, result, types) +
+            generic_call_axioms(called, args, result, types, tvs) +
+            instance_axioms(called, args, result, types)
         )
     ]
 
